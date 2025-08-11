@@ -1,0 +1,448 @@
+trigger:
+  - main
+  - develop
+
+pr:
+  - main
+  - develop
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  nodeVersion: '20.x'
+  dockerImageName: 'my-react-app'
+  dockerRegistry: 'your-registry.azurecr.io'  # Replace with your registry
+  # Security scanning variables
+  sonarProjectKey: 'my-react-app'
+  sonarOrganization: 'your-sonar-org'  # Replace with your SonarCloud organization
+  trivyImageName: 'aquasec/trivy:latest'
+  # Environment variables
+  devEnvironment: 'development'
+  stageEnvironment: 'staging'
+  prodEnvironment: 'production'
+  # Key Vault variables
+  keyVaultName: 'your-keyvault-name'  # Replace with your Key Vault name
+  resourceGroupName: 'your-resource-group'  # Replace with your resource group
+
+stages:
+- stage: Build
+  displayName: 'Build Stage'
+  jobs:
+  - job: Build
+    displayName: 'Build React App'
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: $(nodeVersion)
+      displayName: 'Install Node.js'
+
+    - script: |
+        npm ci
+      displayName: 'Install Dependencies'
+
+    - script: |
+        npm run lint
+      displayName: 'Run Linting'
+
+    - script: |
+        npm run build
+      displayName: 'Build Application'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'dist'
+        artifactName: 'drop'
+      displayName: 'Publish Build Artifacts'
+
+    # Security Scanning - Dependency Check
+    - task: DependencyCheck@5
+      inputs:
+        projectName: 'my-react-app'
+        scanPath: '$(System.DefaultWorkingDirectory)'
+        format: 'HTML'
+        out: '$(System.DefaultWorkingDirectory)/reports'
+      displayName: 'Dependency Vulnerability Scan'
+
+    # Security Scanning - SonarCloud Analysis
+    - task: SonarCloud@1
+      inputs:
+        SonarCloud: 'your-sonarcloud-connection'  # Replace with your SonarCloud service connection
+        organization: $(sonarOrganization)
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: $(sonarProjectKey)
+        cliProjectName: 'my-react-app'
+        cliSources: 'src'
+        cliLanguage: 'js,ts'
+        cliCoverageReportPaths: 'coverage/lcov.info'
+        cliAdditionalArguments: >
+          -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+          -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info
+      displayName: 'SonarCloud Code Analysis'
+
+    # Security Scanning - Container Image Scan
+    - task: Docker@2
+      inputs:
+        containerRegistry: 'your-acr-connection'  # Replace with your ACR connection
+        repository: $(dockerImageName)
+        command: 'buildAndPush'
+        Dockerfile: '**/Dockerfile'
+        tags: |
+          $(Build.BuildId)
+          latest
+      displayName: 'Build and Push Docker Image'
+
+    # Container Security Scan with Trivy
+    - script: |
+        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          $(trivyImageName) image \
+          --format json \
+          --output trivy-results.json \
+          $(dockerRegistry)/$(dockerImageName):$(Build.BuildId)
+      displayName: 'Container Security Scan (Trivy)'
+
+    # Publish Security Scan Results
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/trivy-results.json'
+        mergeTestResults: true
+        testRunTitle: 'Security Scan Results'
+      displayName: 'Publish Security Scan Results'
+
+    # Publish Dependency Check Results
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/dependency-check-report.xml'
+        mergeTestResults: true
+        testRunTitle: 'Dependency Check Results'
+      displayName: 'Publish Dependency Check Results'
+
+- stage: DeployToDev
+  displayName: 'Development Stage'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: DeployToDevelopment
+    displayName: 'Deploy to Development'
+    environment: $(devEnvironment)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+          
+          # Get secrets from Key Vault
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: 'your-azure-subscription'  # Replace with your Azure subscription
+              KeyVaultName: $(keyVaultName)
+              SecretsFilter: '*'
+              RunAsPreJob: true
+            displayName: 'Get Secrets from Key Vault'
+
+          - task: Docker@2
+            inputs:
+              containerRegistry: 'your-acr-connection'
+              repository: $(dockerImageName)
+              command: 'pull'
+              arguments: '$(Build.BuildId)'
+            displayName: 'Pull Docker Image'
+
+          - script: |
+              # Deploy to development environment
+              echo "Deploying to development environment..."
+              # Example: Azure Container Instances
+              az container create \
+                --resource-group $(resourceGroupName) \
+                --name dev-app \
+                --image $(dockerRegistry)/$(dockerImageName):$(Build.BuildId) \
+                --dns-name-label dev-app-$(Build.BuildId) \
+                --ports 80 \
+                --environment-variables \
+                  NODE_ENV=development \
+                  API_URL=$(API_URL) \
+                  DATABASE_URL=$(DATABASE_URL)
+            displayName: 'Deploy to Development'
+
+          - script: |
+              # Health check for development
+              sleep 30
+              curl -f http://dev-app-$(Build.BuildId).$(resourceGroupName).azurecontainer.io || exit 1
+            displayName: 'Development Health Check'
+
+          # Store deployment info for rollback
+          - script: |
+              echo "##vso[task.setvariable variable=DEV_IMAGE_TAG]$(Build.BuildId)"
+              echo "##vso[task.setvariable variable=DEV_DEPLOYMENT_TIME]$(date)"
+            displayName: 'Store Deployment Info'
+
+- stage: DeployToStage
+  displayName: 'Staging Stage'
+  dependsOn: DeployToDev
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployToStaging
+    displayName: 'Deploy to Staging'
+    environment: $(stageEnvironment)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+          
+          # Get secrets from Key Vault
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: 'your-azure-subscription'
+              KeyVaultName: $(keyVaultName)
+              SecretsFilter: '*'
+              RunAsPreJob: true
+            displayName: 'Get Secrets from Key Vault'
+
+          - task: Docker@2
+            inputs:
+              containerRegistry: 'your-acr-connection'
+              repository: $(dockerImageName)
+              command: 'pull'
+              arguments: '$(Build.BuildId)'
+            displayName: 'Pull Docker Image'
+
+          - script: |
+              # Deploy to staging environment
+              echo "Deploying to staging environment..."
+              az container create \
+                --resource-group $(resourceGroupName) \
+                --name stage-app \
+                --image $(dockerRegistry)/$(dockerImageName):$(Build.BuildId) \
+                --dns-name-label stage-app-$(Build.BuildId) \
+                --ports 80 \
+                --environment-variables \
+                  NODE_ENV=staging \
+                  API_URL=$(API_URL) \
+                  DATABASE_URL=$(DATABASE_URL)
+            displayName: 'Deploy to Staging'
+
+          - script: |
+              # Health check for staging
+              sleep 30
+              curl -f http://stage-app-$(Build.BuildId).$(resourceGroupName).azurecontainer.io || exit 1
+            displayName: 'Staging Health Check'
+
+          # Store deployment info for rollback
+          - script: |
+              echo "##vso[task.setvariable variable=STAGE_IMAGE_TAG]$(Build.BuildId)"
+              echo "##vso[task.setvariable variable=STAGE_DEPLOYMENT_TIME]$(date)"
+            displayName: 'Store Staging Deployment Info'
+
+          # Run comprehensive tests in staging
+          - script: |
+              echo "Running comprehensive tests in staging..."
+              # Add your staging tests here
+            displayName: 'Staging Tests'
+
+          # Runtime Security Scan
+          - script: |
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                $(trivyImageName) container \
+                --format json \
+                --output runtime-scan.json \
+                stage-app
+            displayName: 'Runtime Security Scan'
+
+          # Publish Runtime Scan Results
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/runtime-scan.json'
+              mergeTestResults: true
+              testRunTitle: 'Runtime Security Scan Results'
+            displayName: 'Publish Runtime Security Scan Results'
+
+- stage: DeployToProd
+  displayName: 'Production Stage'
+  dependsOn: DeployToStage
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployToProduction
+    displayName: 'Deploy to Production'
+    environment: $(prodEnvironment)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+          
+          # Get secrets from Key Vault
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: 'your-azure-subscription'
+              KeyVaultName: $(keyVaultName)
+              SecretsFilter: '*'
+              RunAsPreJob: true
+            displayName: 'Get Secrets from Key Vault'
+
+          - task: Docker@2
+            inputs:
+              containerRegistry: 'your-acr-connection'
+              repository: $(dockerImageName)
+              command: 'pull'
+              arguments: '$(Build.BuildId)'
+            displayName: 'Pull Production Docker Image'
+
+          # Store current production deployment for rollback
+          - script: |
+              # Get current production deployment info
+              CURRENT_PROD_IMAGE=$(az container show \
+                --resource-group $(resourceGroupName) \
+                --name prod-app \
+                --query "containers[0].image" \
+                --output tsv 2>/dev/null || echo "")
+              echo "##vso[task.setvariable variable=CURRENT_PROD_IMAGE]${CURRENT_PROD_IMAGE}"
+              echo "##vso[task.setvariable variable=ROLLBACK_IMAGE_TAG]${CURRENT_PROD_IMAGE##*:}"
+            displayName: 'Store Current Production Info'
+
+          - script: |
+              # Deploy to production with blue-green strategy
+              echo "Deploying to production..."
+              
+              # Create new production container
+              az container create \
+                --resource-group $(resourceGroupName) \
+                --name prod-app-new \
+                --image $(dockerRegistry)/$(dockerImageName):$(Build.BuildId) \
+                --dns-name-label prod-app-new-$(Build.BuildId) \
+                --ports 80 \
+                --environment-variables \
+                  NODE_ENV=production \
+                  API_URL=$(API_URL) \
+                  DATABASE_URL=$(DATABASE_URL)
+            displayName: 'Deploy New Production Container'
+
+          - script: |
+              # Health check for new production deployment
+              sleep 30
+              curl -f http://prod-app-new-$(Build.BuildId).$(resourceGroupName).azurecontainer.io || exit 1
+            displayName: 'Production Health Check'
+
+          # Switch traffic to new deployment
+          - script: |
+              # Update DNS/load balancer to point to new container
+              echo "Switching traffic to new deployment..."
+              # Add your traffic switching logic here
+              # Example: Update Azure Front Door, Application Gateway, etc.
+            displayName: 'Switch Traffic to New Deployment'
+
+          # Remove old production container
+          - script: |
+              # Remove old production container after successful switch
+              echo "Removing old production container..."
+              az container delete \
+                --resource-group $(resourceGroupName) \
+                --name prod-app \
+                --yes || true
+            displayName: 'Remove Old Production Container'
+
+          # Rename new container to prod-app
+          - script: |
+              # Rename new container to standard name
+              az container update \
+                --resource-group $(resourceGroupName) \
+                --name prod-app-new \
+                --set name=prod-app
+            displayName: 'Rename New Container'
+
+          # Store deployment info for rollback
+          - script: |
+              echo "##vso[task.setvariable variable=PROD_IMAGE_TAG]$(Build.BuildId)"
+              echo "##vso[task.setvariable variable=PROD_DEPLOYMENT_TIME]$(date)"
+            displayName: 'Store Production Deployment Info'
+
+          # Production Security Validation
+          - script: |
+              echo "Running production security validation..."
+              if [ -f "trivy-results.json" ]; then
+                echo "Checking for critical vulnerabilities..."
+                # Add logic to check for critical CVEs
+              fi
+            displayName: 'Production Security Validation'
+
+# Rollback Stage (Manual trigger)
+- stage: Rollback
+  displayName: 'Rollback Stage'
+  dependsOn: []
+  condition: eq(variables['Build.Reason'], 'Manual')
+  jobs:
+  - deployment: RollbackDeployment
+    displayName: 'Rollback Deployment'
+    environment: $(prodEnvironment)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          # Get secrets from Key Vault
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: 'your-azure-subscription'
+              KeyVaultName: $(keyVaultName)
+              SecretsFilter: '*'
+              RunAsPreJob: true
+            displayName: 'Get Secrets from Key Vault'
+
+          - script: |
+              # Rollback to previous version
+              echo "Rolling back to previous version..."
+              
+              # Get rollback image tag (you can set this as a variable)
+              ROLLBACK_TAG=$(ROLLBACK_IMAGE_TAG)
+              if [ -z "$ROLLBACK_TAG" ]; then
+                echo "No rollback tag specified, using latest stable"
+                ROLLBACK_TAG="latest"
+              fi
+              
+              # Deploy rollback version
+              az container create \
+                --resource-group $(resourceGroupName) \
+                --name prod-app-rollback \
+                --image $(dockerRegistry)/$(dockerImageName):$ROLLBACK_TAG \
+                --dns-name-label prod-app-rollback \
+                --ports 80 \
+                --environment-variables \
+                  NODE_ENV=production \
+                  API_URL=$(API_URL) \
+                  DATABASE_URL=$(DATABASE_URL)
+            displayName: 'Deploy Rollback Version'
+
+          - script: |
+              # Health check for rollback
+              sleep 30
+              curl -f http://prod-app-rollback.$(resourceGroupName).azurecontainer.io || exit 1
+            displayName: 'Rollback Health Check'
+
+          # Switch traffic to rollback
+          - script: |
+              echo "Switching traffic to rollback deployment..."
+              # Add your traffic switching logic here
+            displayName: 'Switch Traffic to Rollback'
+
+          # Remove current production container
+          - script: |
+              echo "Removing current production container..."
+              az container delete \
+                --resource-group $(resourceGroupName) \
+                --name prod-app \
+                --yes || true
+            displayName: 'Remove Current Production Container'
+
+          # Rename rollback container
+          - script: |
+              az container update \
+                --resource-group $(resourceGroupName) \
+                --name prod-app-rollback \
+                --set name=prod-app
+            displayName: 'Rename Rollback Container' 
