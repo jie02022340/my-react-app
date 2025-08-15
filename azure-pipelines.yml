@@ -104,6 +104,7 @@ stages:
           $(Build.BuildId)
           latest
       displayName: 'Build and Push Docker Image'
+      condition: ne(variables['Build.Reason'], 'PullRequest')
 
     # Container Security Scan with Trivy
     - script: |
@@ -113,6 +114,7 @@ stages:
           --output trivy-results.json \
           $(dockerRegistry)/$(dockerImageName):$(Build.BuildId)
       displayName: 'Container Security Scan (Trivy)'
+      condition: ne(variables['Build.Reason'], 'PullRequest')
 
     # Publish Security Scan Results
     - task: PublishTestResults@2
@@ -122,6 +124,7 @@ stages:
         mergeTestResults: true
         testRunTitle: 'Security Scan Results'
       displayName: 'Publish Security Scan Results'
+      condition: ne(variables['Build.Reason'], 'PullRequest')
 
     # Publish Dependency Check Results
     - task: PublishTestResults@2
@@ -131,11 +134,12 @@ stages:
         mergeTestResults: true
         testRunTitle: 'Dependency Check Results'
       displayName: 'Publish Dependency Check Results'
+      condition: ne(variables['Build.Reason'], 'PullRequest')
 
 - stage: DeployToDev
   displayName: 'Development Stage'
   dependsOn: Build
-  condition: succeeded()
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
   jobs:
   - deployment: DeployToDevelopment
     displayName: 'Deploy to Development'
@@ -202,7 +206,7 @@ stages:
 - stage: DeployToStage
   displayName: 'Staging Stage'
   dependsOn: DeployToDev
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
   jobs:
   - deployment: DeployToStaging
     displayName: 'Deploy to Staging'
@@ -273,7 +277,7 @@ stages:
 - stage: DeployToProd
   displayName: 'Production Stage'
   dependsOn: DeployToStage
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
   jobs:
   - deployment: DeployToProduction
     displayName: 'Deploy to Production'
