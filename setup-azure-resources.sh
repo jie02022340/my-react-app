@@ -3,7 +3,14 @@
 # Azure Resource Setup Script
 # This script sets up all required Azure resources for the CI/CD pipeline
 
-set -e
+#!/bin/bash
+set -e  # Exit immediately if a command exits with a non-zero status
+
+# ---- CONFIG ----
+SUBSCRIPTION_ID=""  # or leave blank to use current
+# RESOURCE_GROUP="my-react-app-rg"
+# LOCATION="eastus"
+# ACR_NAME="mycontainerregistry$RANDOM"
 
 # Configuration
 RESOURCE_GROUP="my-react-app-rg"
@@ -11,6 +18,53 @@ LOCATION="eastus"
 KEY_VAULT_NAME="my-react-app-kv"
 ACR_NAME="myreactappacr"
 APP_INSIGHTS_NAME="my-react-app-insights"
+
+# ---- AZ LOGIN (optional, if running locally and not already logged in) ----
+# az login
+# az account set --subscription "$SUBSCRIPTION_ID"
+
+echo "Checking Azure subscription..."
+az account show
+
+# ---- FIX: Ensure Microsoft.ContainerRegistry RP is registered ----
+echo "Registering resource provider: Microsoft.ContainerRegistry..."
+az provider register --namespace Microsoft.ContainerRegistry
+
+# Wait until it's registered
+echo "Waiting for Microsoft.ContainerRegistry registration..."
+for i in {1..12}; do
+    STATE=$(az provider show -n Microsoft.ContainerRegistry --query registrationState -o tsv || echo "Unknown")
+    echo "Current state: $STATE"
+    if [ "$STATE" = "Registered" ]; then
+        echo "Microsoft.ContainerRegistry is registered."
+        break
+    fi
+    sleep 10
+done
+
+# Register Microsoft.KeyVault
+echo "Registering RP: Microsoft.KeyVault..."
+az provider register --namespace Microsoft.KeyVault
+for i in {1..12}; do
+  state=$(az provider show -n Microsoft.KeyVault --query registrationState -o tsv || echo "Unknown")
+  echo "KeyVault RP state: $state"
+  [ "$state" = "Registered" ] && break
+  sleep 10
+done
+
+# ---- CREATE RESOURCE GROUP ----
+echo "Creating resource group: $RESOURCE_GROUP..."
+az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+
+# ---- CREATE CONTAINER REGISTRY ----
+echo "Creating Azure Container Registry: $ACR_NAME..."
+az acr create --resource-group "$RESOURCE_GROUP" \
+              --name "$ACR_NAME" \
+              --sku Basic \
+              --admin-enabled true
+
+echo "Setup complete."
+
 
 echo "Setting up Azure resources for React app CI/CD pipeline..."
 
