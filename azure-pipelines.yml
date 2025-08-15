@@ -11,13 +11,9 @@ pool:
 
 variables:
   nodeVersion: '20.x'
-  dockerImageName: 'my-react-app'
-  dockerRegistry: 'your-registry.azurecr.io'  # Replace with your registry
-  acrName: 'your-registry'  # e.g. your-registry if registry is your-registry.azurecr.io
   # Security scanning variables
   sonarProjectKey: 'my-react-app'
   sonarOrganization: 'your-sonar-org'  # Replace with your SonarCloud organization
-  trivyImageName: 'aquasec/trivy:latest'
   # Environment variables
   devEnvironment: 'development'
   stageEnvironment: 'staging'
