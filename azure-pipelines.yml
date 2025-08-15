@@ -13,6 +13,7 @@ variables:
   nodeVersion: '20.x'
   dockerImageName: 'my-react-app'
   dockerRegistry: 'your-registry.azurecr.io'  # Replace with your registry
+  acrName: 'your-registry'  # e.g. your-registry if registry is your-registry.azurecr.io
   # Security scanning variables
   sonarProjectKey: 'my-react-app'
   sonarOrganization: 'your-sonar-org'  # Replace with your SonarCloud organization
@@ -24,6 +25,17 @@ variables:
   # Key Vault variables
   keyVaultName: 'your-keyvault-name'  # Replace with your Key Vault name
   resourceGroupName: 'your-resource-group'  # Replace with your resource group
+  # App Service (Web App) variables
+  appServicePlanName: 'my-react-app-plan'
+  webAppNameDev: 'my-react-app-dev'      # Replace with your actual Web App name
+  webAppNameStage: 'my-react-app-stage'  # Replace with your actual Web App name
+  webAppNameProd: 'my-react-app-prod'    # Replace with your actual Web App name
+  # Static website (no Docker) variables
+  staticIndexDocument: 'index.html'
+  staticErrorDocument: 'index.html'      # SPA fallback
+  storageAccountNameDev: 'yourdevstorageacct'       # must be globally unique, lowercase, 3-24 chars
+  storageAccountNameStage: 'yourstagestorageacct'   # must be globally unique
+  storageAccountNameProd: 'yourprodstorageacct'     # must be globally unique
 
 stages:
 - stage: Build
@@ -144,34 +156,41 @@ stages:
               RunAsPreJob: true
             displayName: 'Get Secrets from Key Vault'
 
-          - task: Docker@2
+          # Provision (idempotent) App Service plan and Web App if missing
+          - task: AzureCLI@2
+            displayName: 'Provision App Service plan and Web App (Dev)'
             inputs:
-              containerRegistry: 'your-acr-connection'
-              repository: $(dockerImageName)
-              command: 'pull'
-              arguments: '$(Build.BuildId)'
-            displayName: 'Pull Docker Image'
+              azureSubscription: 'your-azure-subscription'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -e
+                # Ensure RG exists
+                az group create -n $(resourceGroupName) -l eastus 1>/dev/null
+                # Create or update App Service Plan (Linux)
+                az appservice plan show -g $(resourceGroupName) -n $(appServicePlanName) 1>/dev/null 2>&1 \
+                  || az appservice plan create -g $(resourceGroupName) -n $(appServicePlanName) --is-linux --sku B1
+                # Create Web App if missing
+                az webapp show -g $(resourceGroupName) -n $(webAppNameDev) 1>/dev/null 2>&1 \
+                  || az webapp create -g $(resourceGroupName) -p $(appServicePlanName) -n $(webAppNameDev) -i $(dockerRegistry)/$(dockerImageName):$(Build.BuildId)
+                # Pull ACR creds
+                ACR_USERNAME=$(az acr credential show -n $(acrName) --query username -o tsv)
+                ACR_PASSWORD=$(az acr credential show -n $(acrName) --query passwords[0].value -o tsv)
+                # Configure container image with registry credentials
+                az webapp config container set \
+                  -g $(resourceGroupName) -n $(webAppNameDev) \
+                  -i $(dockerRegistry)/$(dockerImageName):$(Build.BuildId) \
+                  -r https://$(dockerRegistry) -u $ACR_USERNAME -p $ACR_PASSWORD
+                # Apply app settings from KeyVault values
+                az webapp config appsettings set -g $(resourceGroupName) -n $(webAppNameDev) \
+                  --settings NODE_ENV=development API_URL=$(API_URL) DATABASE_URL=$(DATABASE_URL)
+                # Restart web app
+                az webapp restart -g $(resourceGroupName) -n $(webAppNameDev)
 
           - script: |
-              # Deploy to development environment
-              echo "Deploying to development environment..."
-              # Example: Azure Container Instances
-              az container create \
-                --resource-group $(resourceGroupName) \
-                --name dev-app \
-                --image $(dockerRegistry)/$(dockerImageName):$(Build.BuildId) \
-                --dns-name-label dev-app-$(Build.BuildId) \
-                --ports 80 \
-                --environment-variables \
-                  NODE_ENV=development \
-                  API_URL=$(API_URL) \
-                  DATABASE_URL=$(DATABASE_URL)
-            displayName: 'Deploy to Development'
-
-          - script: |
-              # Health check for development
+              # Health check for development Web App
               sleep 30
-              curl -f http://dev-app-$(Build.BuildId).$(resourceGroupName).azurecontainer.io || exit 1
+              curl -f https://$(webAppNameDev).azurewebsites.net || exit 1
             displayName: 'Development Health Check'
 
           # Store deployment info for rollback
@@ -204,33 +223,37 @@ stages:
               RunAsPreJob: true
             displayName: 'Get Secrets from Key Vault'
 
-          - task: Docker@2
+          - task: AzureCLI@2
+            displayName: 'Deploy to Azure Web App (Stage)'
             inputs:
-              containerRegistry: 'your-acr-connection'
-              repository: $(dockerImageName)
-              command: 'pull'
-              arguments: '$(Build.BuildId)'
-            displayName: 'Pull Docker Image'
+              azureSubscription: 'your-azure-subscription'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -e
+                # Ensure plan exists
+                az appservice plan show -g $(resourceGroupName) -n $(appServicePlanName) 1>/dev/null 2>&1 \
+                  || az appservice plan create -g $(resourceGroupName) -n $(appServicePlanName) --is-linux --sku B1
+                # Ensure stage Web App exists
+                az webapp show -g $(resourceGroupName) -n $(webAppNameStage) 1>/dev/null 2>&1 \
+                  || az webapp create -g $(resourceGroupName) -p $(appServicePlanName) -n $(webAppNameStage) -i $(dockerRegistry)/$(dockerImageName):$(Build.BuildId)
+                # ACR creds
+                ACR_USERNAME=$(az acr credential show -n $(acrName) --query username -o tsv)
+                ACR_PASSWORD=$(az acr credential show -n $(acrName) --query passwords[0].value -o tsv)
+                # Configure container
+                az webapp config container set \
+                  -g $(resourceGroupName) -n $(webAppNameStage) \
+                  -i $(dockerRegistry)/$(dockerImageName):$(Build.BuildId) \
+                  -r https://$(dockerRegistry) -u $ACR_USERNAME -p $ACR_PASSWORD
+                # App settings
+                az webapp config appsettings set -g $(resourceGroupName) -n $(webAppNameStage) \
+                  --settings NODE_ENV=staging API_URL=$(API_URL) DATABASE_URL=$(DATABASE_URL)
+                az webapp restart -g $(resourceGroupName) -n $(webAppNameStage)
 
           - script: |
-              # Deploy to staging environment
-              echo "Deploying to staging environment..."
-              az container create \
-                --resource-group $(resourceGroupName) \
-                --name stage-app \
-                --image $(dockerRegistry)/$(dockerImageName):$(Build.BuildId) \
-                --dns-name-label stage-app-$(Build.BuildId) \
-                --ports 80 \
-                --environment-variables \
-                  NODE_ENV=staging \
-                  API_URL=$(API_URL) \
-                  DATABASE_URL=$(DATABASE_URL)
-            displayName: 'Deploy to Staging'
-
-          - script: |
-              # Health check for staging
+              # Health check for staging Web App
               sleep 30
-              curl -f http://stage-app-$(Build.BuildId).$(resourceGroupName).azurecontainer.io || exit 1
+              curl -f https://$(webAppNameStage).azurewebsites.net || exit 1
             displayName: 'Staging Health Check'
 
           # Store deployment info for rollback
@@ -245,23 +268,7 @@ stages:
               # Add your staging tests here
             displayName: 'Staging Tests'
 
-          # Runtime Security Scan
-          - script: |
-              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-                $(trivyImageName) container \
-                --format json \
-                --output runtime-scan.json \
-                stage-app
-            displayName: 'Runtime Security Scan'
-
-          # Publish Runtime Scan Results
-          - task: PublishTestResults@2
-            inputs:
-              testResultsFormat: 'JUnit'
-              testResultsFiles: '**/runtime-scan.json'
-              mergeTestResults: true
-              testRunTitle: 'Runtime Security Scan Results'
-            displayName: 'Publish Runtime Security Scan Results'
+          # (Optional) Add integration tests against https://$(webAppNameStage).azurewebsites.net
 
 - stage: DeployToProd
   displayName: 'Production Stage'
@@ -287,75 +294,38 @@ stages:
               RunAsPreJob: true
             displayName: 'Get Secrets from Key Vault'
 
-          - task: Docker@2
+          - task: AzureCLI@2
+            displayName: 'Deploy to Azure Web App (Prod)'
             inputs:
-              containerRegistry: 'your-acr-connection'
-              repository: $(dockerImageName)
-              command: 'pull'
-              arguments: '$(Build.BuildId)'
-            displayName: 'Pull Production Docker Image'
-
-          # Store current production deployment for rollback
-          - script: |
-              # Get current production deployment info
-              CURRENT_PROD_IMAGE=$(az container show \
-                --resource-group $(resourceGroupName) \
-                --name prod-app \
-                --query "containers[0].image" \
-                --output tsv 2>/dev/null || echo "")
-              echo "##vso[task.setvariable variable=CURRENT_PROD_IMAGE]${CURRENT_PROD_IMAGE}"
-              echo "##vso[task.setvariable variable=ROLLBACK_IMAGE_TAG]${CURRENT_PROD_IMAGE##*:}"
-            displayName: 'Store Current Production Info'
-
-          - script: |
-              # Deploy to production with blue-green strategy
-              echo "Deploying to production..."
-              
-              # Create new production container
-              az container create \
-                --resource-group $(resourceGroupName) \
-                --name prod-app-new \
-                --image $(dockerRegistry)/$(dockerImageName):$(Build.BuildId) \
-                --dns-name-label prod-app-new-$(Build.BuildId) \
-                --ports 80 \
-                --environment-variables \
-                  NODE_ENV=production \
-                  API_URL=$(API_URL) \
-                  DATABASE_URL=$(DATABASE_URL)
-            displayName: 'Deploy New Production Container'
+              azureSubscription: 'your-azure-subscription'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -e
+                # Ensure plan exists
+                az appservice plan show -g $(resourceGroupName) -n $(appServicePlanName) 1>/dev/null 2>&1 \
+                  || az appservice plan create -g $(resourceGroupName) -n $(appServicePlanName) --is-linux --sku B1
+                # Ensure prod Web App exists
+                az webapp show -g $(resourceGroupName) -n $(webAppNameProd) 1>/dev/null 2>&1 \
+                  || az webapp create -g $(resourceGroupName) -p $(appServicePlanName) -n $(webAppNameProd) -i $(dockerRegistry)/$(dockerImageName):$(Build.BuildId)
+                # ACR creds
+                ACR_USERNAME=$(az acr credential show -n $(acrName) --query username -o tsv)
+                ACR_PASSWORD=$(az acr credential show -n $(acrName) --query passwords[0].value -o tsv)
+                # Configure container
+                az webapp config container set \
+                  -g $(resourceGroupName) -n $(webAppNameProd) \
+                  -i $(dockerRegistry)/$(dockerImageName):$(Build.BuildId) \
+                  -r https://$(dockerRegistry) -u $ACR_USERNAME -p $ACR_PASSWORD
+                # App settings
+                az webapp config appsettings set -g $(resourceGroupName) -n $(webAppNameProd) \
+                  --settings NODE_ENV=production API_URL=$(API_URL) DATABASE_URL=$(DATABASE_URL)
+                az webapp restart -g $(resourceGroupName) -n $(webAppNameProd)
 
           - script: |
-              # Health check for new production deployment
+              # Production Health check
               sleep 30
-              curl -f http://prod-app-new-$(Build.BuildId).$(resourceGroupName).azurecontainer.io || exit 1
+              curl -f https://$(webAppNameProd).azurewebsites.net || exit 1
             displayName: 'Production Health Check'
-
-          # Switch traffic to new deployment
-          - script: |
-              # Update DNS/load balancer to point to new container
-              echo "Switching traffic to new deployment..."
-              # Add your traffic switching logic here
-              # Example: Update Azure Front Door, Application Gateway, etc.
-            displayName: 'Switch Traffic to New Deployment'
-
-          # Remove old production container
-          - script: |
-              # Remove old production container after successful switch
-              echo "Removing old production container..."
-              az container delete \
-                --resource-group $(resourceGroupName) \
-                --name prod-app \
-                --yes || true
-            displayName: 'Remove Old Production Container'
-
-          # Rename new container to prod-app
-          - script: |
-              # Rename new container to standard name
-              az container update \
-                --resource-group $(resourceGroupName) \
-                --name prod-app-new \
-                --set name=prod-app
-            displayName: 'Rename New Container'
 
           # Store deployment info for rollback
           - script: |
@@ -394,55 +364,31 @@ stages:
               RunAsPreJob: true
             displayName: 'Get Secrets from Key Vault'
 
-          - script: |
-              # Rollback to previous version
-              echo "Rolling back to previous version..."
-              
-              # Get rollback image tag (you can set this as a variable)
-              ROLLBACK_TAG=$(ROLLBACK_IMAGE_TAG)
-              if [ -z "$ROLLBACK_TAG" ]; then
-                echo "No rollback tag specified, using latest stable"
-                ROLLBACK_TAG="latest"
-              fi
-              
-              # Deploy rollback version
-              az container create \
-                --resource-group $(resourceGroupName) \
-                --name prod-app-rollback \
-                --image $(dockerRegistry)/$(dockerImageName):$ROLLBACK_TAG \
-                --dns-name-label prod-app-rollback \
-                --ports 80 \
-                --environment-variables \
-                  NODE_ENV=production \
-                  API_URL=$(API_URL) \
-                  DATABASE_URL=$(DATABASE_URL)
-            displayName: 'Deploy Rollback Version'
+          - task: AzureCLI@2
+            displayName: 'Rollback to previous image (Prod)'
+            inputs:
+              azureSubscription: 'your-azure-subscription'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -e
+                ROLLBACK_TAG=$(ROLLBACK_IMAGE_TAG)
+                if [ -z "$ROLLBACK_TAG" ]; then
+                  echo "No rollback tag specified, using 'latest'"
+                  ROLLBACK_TAG=latest
+                fi
+                # ACR creds
+                ACR_USERNAME=$(az acr credential show -n $(acrName) --query username -o tsv)
+                ACR_PASSWORD=$(az acr credential show -n $(acrName) --query passwords[0].value -o tsv)
+                # Point prod web app to previous image tag
+                az webapp config container set \
+                  -g $(resourceGroupName) -n $(webAppNameProd) \
+                  -i $(dockerRegistry)/$(dockerImageName):$ROLLBACK_TAG \
+                  -r https://$(dockerRegistry) -u $ACR_USERNAME -p $ACR_PASSWORD
+                az webapp restart -g $(resourceGroupName) -n $(webAppNameProd)
 
           - script: |
-              # Health check for rollback
+              # Health check after rollback
               sleep 30
-              curl -f http://prod-app-rollback.$(resourceGroupName).azurecontainer.io || exit 1
+              curl -f https://$(webAppNameProd).azurewebsites.net || exit 1
             displayName: 'Rollback Health Check'
-
-          # Switch traffic to rollback
-          - script: |
-              echo "Switching traffic to rollback deployment..."
-              # Add your traffic switching logic here
-            displayName: 'Switch Traffic to Rollback'
-
-          # Remove current production container
-          - script: |
-              echo "Removing current production container..."
-              az container delete \
-                --resource-group $(resourceGroupName) \
-                --name prod-app \
-                --yes || true
-            displayName: 'Remove Current Production Container'
-
-          # Rename rollback container
-          - script: |
-              az container update \
-                --resource-group $(resourceGroupName) \
-                --name prod-app-rollback \
-                --set name=prod-app
-            displayName: 'Rename Rollback Container' 
