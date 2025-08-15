@@ -36,6 +36,8 @@ variables:
   storageAccountNameDev: 'yourdevstorageacct'       # must be globally unique, lowercase, 3-24 chars
   storageAccountNameStage: 'yourstagestorageacct'   # must be globally unique
   storageAccountNameProd: 'yourprodstorageacct'     # must be globally unique
+  # Sonar (Cloud or self-hosted SonarQube)
+  sonarHostUrl: 'https://sonarcloud.io'  # Set to your SonarQube URL when not using SonarCloud
 
 stages:
 - stage: Build
@@ -67,31 +69,57 @@ stages:
         artifactName: 'drop'
       displayName: 'Publish Build Artifacts'
 
-    # Security Scanning - Dependency Check
-    - task: DependencyCheck@5
-      inputs:
-        projectName: 'my-react-app'
-        scanPath: '$(System.DefaultWorkingDirectory)'
-        format: 'HTML'
-        out: '$(System.DefaultWorkingDirectory)/reports'
-      displayName: 'Dependency Vulnerability Scan'
+    # Security Scanning - OWASP Dependency-Check via Docker
+    - script: |
+        set -e
+        mkdir -p $(System.DefaultWorkingDirectory)/reports
+        mkdir -p $(System.DefaultWorkingDirectory)/odc-data
+        docker run --rm \
+          -v "$(System.DefaultWorkingDirectory):/src" \
+          -v "$(System.DefaultWorkingDirectory)/odc-data:/usr/share/dependency-check/data" \
+          -v "$(System.DefaultWorkingDirectory)/reports:/report" \
+          owasp/dependency-check:latest \
+          --scan /src \
+          --format HTML \
+          --format XML \
+          --out /report \
+          --project "my-react-app"
+      displayName: 'Dependency Vulnerability Scan (OWASP DC)'
 
-    # Security Scanning - SonarCloud Analysis
-    - task: SonarCloud@1
-      inputs:
-        SonarCloud: 'your-sonarcloud-connection'  # Replace with your SonarCloud service connection
-        organization: $(sonarOrganization)
-        scannerMode: 'CLI'
-        configMode: 'manual'
-        cliProjectKey: $(sonarProjectKey)
-        cliProjectName: 'my-react-app'
-        cliSources: 'src'
-        cliLanguage: 'js,ts'
-        cliCoverageReportPaths: 'coverage/lcov.info'
-        cliAdditionalArguments: >
-          -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
-          -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info
-      displayName: 'SonarCloud Code Analysis'
+    # Static Code Analysis - Sonar (Cloud or SonarQube)
+    - script: |
+        set -e
+        sudo apt-get update -y
+        sudo apt-get install -y unzip curl
+        SCANNER_VERSION=5.0.1.3006
+        curl -sSLo scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-$SCANNER_VERSION-linux.zip
+        unzip -q scanner.zip
+        mv sonar-scanner-* sonar-scanner
+        export PATH=$(pwd)/sonar-scanner/bin:$PATH
+        if [ -z "$(sonarOrganization)" ] || [ "$(sonarHostUrl)" != "https://sonarcloud.io" ]; then
+          echo "Running against SonarQube at $(sonarHostUrl)"
+          sonar-scanner \
+            -Dsonar.projectKey=$(sonarProjectKey) \
+            -Dsonar.host.url=$(sonarHostUrl) \
+            -Dsonar.login=$(SONAR_TOKEN) \
+            -Dsonar.sources=src \
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+            -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info
+        else
+          echo "Running against SonarCloud"
+          sonar-scanner \
+            -Dsonar.projectKey=$(sonarProjectKey) \
+            -Dsonar.organization=$(sonarOrganization) \
+            -Dsonar.host.url=$(sonarHostUrl) \
+            -Dsonar.login=$(SONAR_TOKEN) \
+            -Dsonar.sources=src \
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+            -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info
+        fi
+      displayName: 'Sonar Analysis (SonarCloud/SonarQube)'
+      env:
+        SONAR_TOKEN: $(SONAR_TOKEN)
+      condition: and(succeeded(), ne(variables['SONAR_TOKEN'], ''))
 
     # Security Scanning - Container Image Scan
     - task: Docker@2
@@ -126,14 +154,12 @@ stages:
       displayName: 'Publish Security Scan Results'
       condition: ne(variables['Build.Reason'], 'PullRequest')
 
-    # Publish Dependency Check Results
-    - task: PublishTestResults@2
+    # Publish Dependency-Check Reports as artifacts
+    - task: PublishBuildArtifacts@1
       inputs:
-        testResultsFormat: 'JUnit'
-        testResultsFiles: '**/dependency-check-report.xml'
-        mergeTestResults: true
-        testRunTitle: 'Dependency Check Results'
-      displayName: 'Publish Dependency Check Results'
+        pathToPublish: '$(System.DefaultWorkingDirectory)/reports'
+        artifactName: 'dependency-check'
+      displayName: 'Publish Dependency-Check Reports'
       condition: ne(variables['Build.Reason'], 'PullRequest')
 
 - stage: DeployToDev
